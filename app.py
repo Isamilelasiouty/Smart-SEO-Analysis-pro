@@ -1491,6 +1491,7 @@ def main():
             with st.spinner("Connecting via Service Account..."):
                 try:
                     raw_sheets = load_from_google_sheets_service_account(sheet_url, sa_json)
+                    st.session_state["sa_json_connected"] = sa_json  # save for output sheet
                     st.success(f"✅ Connected — {len(raw_sheets)} tab(s) loaded")
                 except Exception as e:
                     load_error = str(e)
@@ -1665,14 +1666,92 @@ def main():
     # EXPORT SECTION
     # ─────────────────────────────
     st.markdown('<div class="section-header">💾 Export Reports</div>', unsafe_allow_html=True)
+
+    # ── Row 1: Google Sheets Save (full width, primary CTA) ──
+    st.markdown("""
+    <div style='background:linear-gradient(135deg,rgba(107,77,223,.15),rgba(0,212,170,.08));
+                border:1px solid rgba(107,77,223,.4);border-radius:20px;padding:28px;margin-bottom:20px;'>
+        <div style='font-family:Syne,sans-serif;font-size:18px;font-weight:800;color:#e8eaf6;margin-bottom:6px;'>
+            🗂️ Save to Google Sheets
+        </div>
+        <div style='color:#8892b0;font-size:13px;margin-bottom:18px;'>
+            Creates a brand-new Google Sheet with all analysis tabs, formatted headers, and frozen rows —
+            just like the original Colab tool.
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Determine if SA JSON is already available from this session
+    sa_json_for_save = st.session_state.get("sa_json_connected", "")
+
+    if mode == "🔐 Google Sheets (Service Account)" and sa_json_for_save:
+        # Already connected — one-click save
+        if st.button("🚀 Create New Google Sheet with Results", use_container_width=True):
+            with st.spinner("Creating your Google Sheet... this may take 30–60 seconds ⏳"):
+                try:
+                    new_url = save_results_to_google_sheet(all_results, overview_data, sa_json_for_save)
+                    st.success("✅ Google Sheet created successfully!")
+                    st.markdown(f"""
+                    <a href="{new_url}" target="_blank"
+                       style="display:inline-block;background:linear-gradient(135deg,#6b4ddf,#00d4aa);
+                              color:#fff;padding:14px 28px;border-radius:12px;font-size:15px;
+                              text-decoration:none;font-weight:700;margin-top:8px;">
+                        📊 Open Your New Report Sheet →
+                    </a>
+                    """, unsafe_allow_html=True)
+                except Exception as e:
+                    st.error(f"❌ Failed to create sheet: {e}")
+                    st.info("Make sure your Service Account has Editor access to Google Drive.")
+    else:
+        # Ask for SA JSON inline (works for CSV/Excel and Public modes too)
+        with st.expander("🔐 Enter Service Account JSON to save to Google Sheets", expanded=(mode != "📁 Upload CSV / Excel")):
+            st.markdown("""
+            <div style='color:#8892b0;font-size:12px;line-height:1.7;margin-bottom:10px;'>
+            Don't have a Service Account yet?<br>
+            1. <a href='https://console.cloud.google.com/' target='_blank' style='color:#8a6be8;'>Google Cloud Console</a>
+               → Enable <strong>Sheets API</strong> + <strong>Drive API</strong><br>
+            2. Create Service Account → Download JSON key<br>
+            3. Paste the JSON content below
+            </div>
+            """, unsafe_allow_html=True)
+            sa_input = st.text_area(
+                "Service Account JSON",
+                placeholder='{"type": "service_account", "project_id": "...", ...}',
+                height=130,
+                key="sa_json_for_save_input",
+                label_visibility="collapsed",
+            )
+            if st.button("🚀 Create New Google Sheet with Results", use_container_width=True, key="save_sheet_btn"):
+                if not sa_input.strip():
+                    st.warning("Please paste your Service Account JSON first.")
+                else:
+                    with st.spinner("Creating your Google Sheet... this may take 30–60 seconds ⏳"):
+                        try:
+                            new_url = save_results_to_google_sheet(all_results, overview_data, sa_input.strip())
+                            st.success("✅ Google Sheet created successfully!")
+                            st.markdown(f"""
+                            <a href="{new_url}" target="_blank"
+                               style="display:inline-block;background:linear-gradient(135deg,#6b4ddf,#00d4aa);
+                                      color:#fff;padding:14px 28px;border-radius:12px;font-size:15px;
+                                      text-decoration:none;font-weight:700;margin-top:8px;">
+                                📊 Open Your New Report Sheet →
+                            </a>
+                            """, unsafe_allow_html=True)
+                        except Exception as e:
+                            st.error(f"❌ Failed: {e}")
+                            st.info("Tip: Make sure Sheets API and Drive API are enabled in your Google Cloud project.")
+
+    st.markdown("<div style='height:8px;'></div>", unsafe_allow_html=True)
+
+    # ── Row 2: Excel + PDF downloads ──
     ex1, ex2 = st.columns(2)
 
     with ex1:
         st.markdown("#### 📊 Excel Report")
-        st.markdown("<div style='color:#8892b0;font-size:13px;margin-bottom:12px;'>All tabs in one Excel file with full data</div>", unsafe_allow_html=True)
+        st.markdown("<div style='color:#8892b0;font-size:13px;margin-bottom:12px;'>All tabs in one Excel file</div>", unsafe_allow_html=True)
         excel_bytes = export_to_excel(all_results)
         st.download_button(
-            label="⬇️ Download Excel Report",
+            label="⬇️ Download Excel (.xlsx)",
             data=excel_bytes,
             file_name=f"smart_seo_analysis_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -1681,7 +1760,7 @@ def main():
 
     with ex2:
         st.markdown("#### 📄 PDF Summary")
-        st.markdown("<div style='color:#8892b0;font-size:13px;margin-bottom:12px;'>Executive summary PDF for sharing</div>", unsafe_allow_html=True)
+        st.markdown("<div style='color:#8892b0;font-size:13px;margin-bottom:12px;'>Executive summary for sharing</div>", unsafe_allow_html=True)
         pdf_bytes = generate_pdf_report(overview_data, all_results)
         if pdf_bytes:
             st.download_button(
@@ -1692,7 +1771,7 @@ def main():
                 use_container_width=True,
             )
         else:
-            st.warning("PDF export requires `fpdf2` — install it with `pip install fpdf2`")
+            st.warning("PDF export requires `fpdf2` — run `pip install fpdf2`")
 
     # ─────────────────────────────
     # FOOTER
