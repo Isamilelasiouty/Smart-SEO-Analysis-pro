@@ -1055,23 +1055,72 @@ def load_from_google_sheets_service_account(sheet_url, service_account_json):
         raise RuntimeError(f"Service Account error: {e}")
 
 def load_from_google_sheets_public(sheet_url):
-    """Load via public CSV export (no auth needed for public sheets)"""
+    """Load via public CSV export — fetches ALL tabs automatically"""
     try:
         import requests
+
         # Extract sheet ID
         match = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", sheet_url)
         if not match:
-            raise ValueError("Invalid Google Sheets URL")
+            raise ValueError("Invalid Google Sheets URL. Make sure it looks like: https://docs.google.com/spreadsheets/d/SHEET_ID/...")
         sheet_id = match.group(1)
-        # Try to get gid (tab id)
-        gid_match = re.search(r"[#&]gid=(\d+)", sheet_url)
-        gid = gid_match.group(1) if gid_match else "0"
-        csv_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
-        r = requests.get(csv_url, timeout=30)
-        if r.status_code != 200:
-            raise ValueError(f"Could not access sheet. Make sure it's shared publicly. Status: {r.status_code}")
-        df = pd.read_csv(io.StringIO(r.text), on_bad_lines="skip")
-        return [("Sheet1", df)]
+
+        # ── Step 1: fetch the HTML page to discover all tab gids & names ──
+        html_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/edit"
+        headers  = {"User-Agent": "Mozilla/5.0"}
+        html_r   = requests.get(html_url, headers=headers, timeout=30)
+
+        tab_info = []  # list of (gid, name)
+
+        if html_r.status_code == 200:
+            # Pattern: "gid":123456,"name":"Sheet1"  (appears inside the page JSON)
+            pattern = r'"gid"\s*:\s*(\d+)[^}]*?"name"\s*:\s*"([^"]+)"'
+            matches = re.findall(pattern, html_r.text)
+            if matches:
+                seen_gids = set()
+                for gid, name in matches:
+                    if gid not in seen_gids:
+                        seen_gids.add(gid)
+                        tab_info.append((gid, name))
+
+        # Fallback: if we couldn't scrape tabs, try the gid from the URL or default 0
+        if not tab_info:
+            gid_match = re.search(r"[#&?]gid=(\d+)", sheet_url)
+            gid = gid_match.group(1) if gid_match else "0"
+            tab_info = [(gid, "Sheet1")]
+
+        # ── Step 2: download each tab as CSV ──
+        sheets = []
+        failed = []
+        for gid, name in tab_info:
+            csv_url = (
+                f"https://docs.google.com/spreadsheets/d/{sheet_id}"
+                f"/export?format=csv&gid={gid}"
+            )
+            r = requests.get(csv_url, headers=headers, timeout=30)
+            if r.status_code == 200:
+                try:
+                    df = pd.read_csv(io.StringIO(r.text), on_bad_lines="skip")
+                    if not df.empty:
+                        sheets.append((name, df))
+                except Exception:
+                    failed.append(name)
+            else:
+                failed.append(f"{name} (HTTP {r.status_code})")
+
+        if not sheets:
+            status_hint = ""
+            if failed:
+                status_hint = f" (failed tabs: {', '.join(failed)})"
+            raise ValueError(
+                f"Could not load any tabs from the sheet{status_hint}. "
+                "Make sure the sheet is shared publicly: Share → Anyone with the link → Viewer."
+            )
+
+        return sheets
+
+    except RuntimeError:
+        raise
     except Exception as e:
         raise RuntimeError(f"Public sheet error: {e}")
 
@@ -1267,6 +1316,60 @@ def export_to_excel(results):
                 df.to_excel(writer, sheet_name=safe_name, index=False)
     buf.seek(0)
     return buf.getvalue()
+
+
+def export_to_google_sheets(results, sa_json_str):
+    """
+    Create a new Google Sheet and write all analysis tabs into it.
+    Requires a Service Account JSON with Google Sheets + Drive API enabled.
+    Returns the URL of the new sheet.
+    """
+    try:
+        import gspread
+        from google.oauth2.service_account import Credentials
+
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        sa_info = json.loads(sa_json_str)
+        creds   = Credentials.from_service_account_info(sa_info, scopes=scopes)
+        gc      = gspread.authorize(creds)
+
+        title = f"Smart SEO Analysis — {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+        sh    = gc.create(title)
+
+        # Make accessible to anyone with the link (viewer)
+        sh.share(None, perm_type="anyone", role="reader")
+
+        first_tab = True
+        for tab_name, df in results.items():
+            if df is None or df.empty:
+                continue
+            safe_name = re.sub(r"[\\/*?:\[\]]", "", tab_name)[:100]
+            if first_tab:
+                ws = sh.sheet1
+                ws.update_title(safe_name)
+                first_tab = False
+            else:
+                ws = sh.add_worksheet(
+                    title=safe_name,
+                    rows=max(len(df) + 10, 50),
+                    cols=max(len(df.columns) + 2, 10),
+                )
+            # Write header + data in one batch
+            data_to_write = [df.columns.tolist()] + df.astype(str).values.tolist()
+            ws.update(data_to_write, value_input_option="USER_ENTERED")
+
+        return sh.url
+
+    except ImportError:
+        raise RuntimeError("gspread غير مثبت — شغّل: pip install gspread google-auth")
+    except json.JSONDecodeError:
+        raise RuntimeError("Service Account JSON غير صالح — تأكد من نسخ الـ JSON كامل")
+    except Exception as e:
+        raise RuntimeError(f"فشل إنشاء الشيت: {e}")
+
 
 # ─────────────────────────────────────────────
 # SIDEBAR
@@ -1576,7 +1679,7 @@ def main():
     # EXPORT SECTION
     # ─────────────────────────────
     st.markdown('<div class="section-header">💾 Export Reports</div>', unsafe_allow_html=True)
-    ex1, ex2 = st.columns(2)
+    ex1, ex2, ex3 = st.columns(3)
 
     with ex1:
         st.markdown("#### 📊 Excel Report")
@@ -1604,6 +1707,43 @@ def main():
             )
         else:
             st.warning("PDF export requires `fpdf2` — install it with `pip install fpdf2`")
+
+    with ex3:
+        st.markdown("#### 🟢 Export to Google Sheets")
+        st.markdown("<div style='color:#8892b0;font-size:13px;margin-bottom:12px;'>Write analysis to a new Google Sheet (requires Service Account)</div>", unsafe_allow_html=True)
+        with st.expander("🔑 Service Account JSON", expanded=False):
+            st.markdown("""
+            <div style='color:#8892b0;font-size:11px;line-height:1.8;'>
+            1. Go to <a href='https://console.cloud.google.com/' target='_blank' style='color:#8a6be8;'>Google Cloud Console</a><br>
+            2. Enable <b>Google Sheets API</b> + <b>Google Drive API</b><br>
+            3. Create a Service Account → Download JSON key<br>
+            4. Paste the full JSON below
+            </div>
+            """, unsafe_allow_html=True)
+            export_sa_json = st.text_area(
+                "Service Account JSON",
+                placeholder='{"type": "service_account", ...}',
+                height=100,
+                key="export_sa_json",
+                label_visibility="collapsed",
+            )
+        if st.button("🚀 Create Google Sheet", use_container_width=True, key="export_gsheet_btn"):
+            if not export_sa_json.strip():
+                st.error("❌ أدخل Service Account JSON أولاً")
+            else:
+                with st.spinner("جاري إنشاء الشيت وكتابة البيانات..."):
+                    try:
+                        sheet_url = export_to_google_sheets(all_results, export_sa_json.strip())
+                        st.success("✅ تم إنشاء الشيت بنجاح!")
+                        st.markdown(
+                            f"<a href='{sheet_url}' target='_blank' style='display:block;text-align:center;"
+                            f"background:linear-gradient(135deg,#10b981,#00d4aa);color:#fff;padding:10px 16px;"
+                            f"border-radius:10px;font-weight:700;text-decoration:none;margin-top:8px;'>"
+                            f"🔗 افتح الشيت الجديد</a>",
+                            unsafe_allow_html=True,
+                        )
+                    except Exception as e:
+                        st.error(f"❌ {e}")
 
     # ─────────────────────────────
     # FOOTER
